@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Likidy's Gym Advisor (PDA)
 // @namespace    local.torn.gym.ratio.pda
-// @version      0.5.0
+// @version      0.6.0
 // @license      MIT
 // @description  Mobile gym advisor with perk-adjusted previews, autofill, completion reset and manual unlock.
 // @match        https://www.torn.com/gym.php*
@@ -399,13 +399,37 @@
     return null;
   }
  
+  function readHappiness() {
+    // Resource bars can live outside #gymroot, including in the mobile sidebar.
+    const bars = document.querySelectorAll(
+      '#barHappy, #sidebarroot [class*="happy"], #sidebar [class*="happy"], ' +
+      '[class*="bar"][class*="happy"], [class*="bar"][class*="happiness"], ' +
+      '[data-resource="happy"], [data-resource="happiness"], ' +
+      '[title^="Happy:" i], [title^="Happiness:" i], ' +
+      '[aria-label^="Happy" i], [aria-label^="Happiness" i]');
+    for (const bar of bars) {
+      if (bar.closest(`#${PANEL_ID}`)) continue;
+      for (const text of [bar.textContent, bar.getAttribute('aria-label'),
+        bar.getAttribute('title'), bar.getAttribute('aria-valuetext')]) {
+        const pair = text?.match(/([\d,]+)\s*\/\s*[\d,]+/);
+        if (pair) return parseNumber(pair[1]); // Always the current value, never the maximum.
+      }
+      const current = bar.matches('[aria-valuenow]') ? bar : bar.querySelector('[aria-valuenow]');
+      const value = parseNumber(current?.getAttribute('aria-valuenow'));
+      // Some progress bars expose percentages instead of resource quantities.
+      if (Number.isFinite(value) && parseNumber(current.getAttribute('aria-valuemax')) > 100) return value;
+    }
+    const labelled = document.body.innerText?.match(/\bHapp(?:y|iness)\s*:?\s*([\d,]+)\s*\/\s*[\d,]+/i);
+    return parseNumber(labelled?.[1]);
+  }
+
   function readCurrentPage() {
+    const happy = readHappiness();
     const root = document.querySelector('#gymroot') || document.body;
     const text = root.innerText || '';
     const stats = Object.fromEntries(ALL_STATS.map(key => [key, readStat(key)]));
     const energyMatch = text.match(/\byou have\s+([\d,]+)\s*\/\s*[\d,]+\s+energy(?:\s+available)?\b/i);
     const fallbackEnergy = text.match(/\bEnergy\s*:\s*([\d,]+)\s*\/\s*[\d,]+/i);
-    const happyMatch = text.match(/\bHapp(?:y|iness)\s*:?\s*([\d,]+)\s*\/\s*[\d,]+/i);
     const welcome = text.match(/\bWelcome to\s+([^!\n]{2,60})!/i);
     let gym = GYM_BY_NAME.get(welcome?.[1]?.trim().toLowerCase()) || null;
     if (!gym && energyMatch) {
@@ -424,7 +448,7 @@
     return {
       stats,
       energy: parseNumber((energyMatch || fallbackEnergy)?.[1]),
-      happy: parseNumber(happyMatch?.[1]),
+      happy: happy ?? 5025, happyEstimated: happy === null,
       gym,
       gymName: gym?.name || ''
     };
@@ -529,6 +553,7 @@
       pendingTraining.clear();
       autoAttempts.clear();
       manualEdits.clear();
+      batchEnergyLow = lastObservedEnergy;
       try { localStorage.setItem(TARGET_KEY, JSON.stringify(target)); } catch (_) {}
       error.textContent = '';
       panel.querySelector('.tga-settings').open = false;
@@ -547,12 +572,13 @@
   }
  
   // Native Torn gym counts are separate from Advisor settings inputs.
-  const nativeCounts = new WeakMap();
+  let nativeCounts = new WeakMap();
   const autoAttempts = new Map();
   const manualEdits = new Map();
   const completedThisBatch = new Set();
   const pendingTraining = new Map();
   let lastObservedEnergy = null;
+  let batchEnergyLow = null;
   let updatingNative = false;
   let lastNativeData = null;
   let lastNativePlan = null;
@@ -601,9 +627,13 @@
   }
  
   function trackTrainingCompletion(page) {
-    // A meaningful energy gain begins a new batch. Ignore single-E regeneration.
-    if (Number.isFinite(lastObservedEnergy) && Number.isFinite(page.energy) &&
-        page.energy - lastObservedEnergy >= Math.max(20, 2 * (page.gym?.energy ?? 10))) {
+    // Measure net regeneration since the lowest reading, not just the latest tick.
+    if (Number.isFinite(page.energy)) {
+      if (!Number.isFinite(batchEnergyLow) || page.energy < lastObservedEnergy) batchEnergyLow = page.energy;
+    }
+    if (Number.isFinite(page.energy) &&
+        page.energy - batchEnergyLow >= Math.max(20, 2 * (page.gym?.energy ?? 10))) {
+      batchEnergyLow = page.energy;
       completedThisBatch.clear();
       pendingTraining.clear();
       autoAttempts.clear();
@@ -640,7 +670,18 @@
       `Est. +${formatGain(gain)} ${ABBR[key]}${shortfall}`);
   }
  
+  function hasTrainingData(page) {
+    return Number.isFinite(page.energy) && selected().every(key => Number.isFinite(page.stats[key]));
+  }
+
   function updateNativeCounts(page, plan, picks) {
+    if (!hasTrainingData(page)) {
+      lastNativeData = lastNativePlan = lastNativePicks = null;
+      autoAttempts.clear();
+      nativeCounts = new WeakMap();
+      for (const key of ALL_STATS) statTile(key)?.removeAttribute('data-tga-gain');
+      return;
+    }
     lastNativeData = page;
     lastNativePlan = plan;
     lastNativePicks = picks;
@@ -670,6 +711,8 @@
         completed: completedThisBatch.has(key),
         factors: perks?.factors ?? ZERO_PERKS
       });
+      // An edit made during an incomplete reading belongs to the first recovered scene.
+      if (manualEdits.has(key) && manualEdits.get(key) === null) manualEdits.set(key, scene);
       if (!allowAnyTraining && manualEdits.get(key) && manualEdits.get(key) !== scene) {
         manualEdits.delete(key);
       }
@@ -709,8 +752,8 @@
     if (!key) return;
     const history = nativeCounts.get(event.target);
     if (history) history.manual = true;
+    manualEdits.set(key, lastNativeData ? pageContext(lastNativeData) : null);
     if (lastNativeData) {
-      manualEdits.set(key, pageContext(lastNativeData));
       updateGainLabel(key, lastNativeData);
     }
   }, true);
@@ -792,27 +835,24 @@
   document.addEventListener('touchstart', guardTrainEvent, { capture: true, passive: false });
  
   function paint(panel, data, best, verified) {
-    const { stats, energy, gym } = data;
-    const happyIsEstimated = !Number.isFinite(data.happy);
-    const happy = happyIsEstimated ? 5000 : data.happy;
-    const previewPage = happyIsEstimated ? { ...data, happy } : data;
+    const { stats, energy, happy, gym } = data;
     const keys = selected();
     panel.querySelector('.tga-meta').innerHTML = `${gym ? `${gym.name} · ${gym.energy} E/train` : 'Gym not recognized'} · <b>${Number.isFinite(energy) ? energy : '?'} E available</b>`;
+    if (data.happyEstimated) {
+      panel.querySelector('.tga-meta').insertAdjacentText('beforeend', ' · Happy unavailable · estimating at 5,025');
+    }
     panel.querySelector('.tga-targets').textContent = keys.map(k => `${target[k]}% ${ABBR[k]}`).join(' · ');
     panel.querySelector('.tga-perks').textContent =
       (perks ? 'Perks: ' + keys.map(k => `${ABBR[k]} ×${perks.factors[k].toFixed(3)}`).join(' ') :
         'Perks not loaded') + (perkError ? ' · ' + perkError : '');
-    const present = keys.every(k => Number.isFinite(stats[k])) && Number.isFinite(energy);
+    const present = hasTrainingData(data);
     const grid = panel.querySelector('.tga-grid');
     grid.style.setProperty('--tga-columns', String(keys.length));
     const alloc = panel.querySelector('.tga-alloc');
-    if (happyIsEstimated) {
-      panel.querySelector('.tga-meta').insertAdjacentText('beforeend', ' · Est. using 5,000 happy');
-    }
     if (!present) {
       grid.textContent = '';
       alloc.textContent = 'Waiting for visible battle stats and energy.';
-      for (const key of ALL_STATS) statTile(key)?.removeAttribute('data-tga-gain');
+      updateNativeCounts(data, null, null);
       return;
     }
     const shares = proportions(stats, keys);
@@ -823,17 +863,17 @@
     }).join('');
     if (!gym) {
       alloc.textContent = 'Training recommendation unavailable.';
-      updateNativeCounts(previewPage, null, null);
+      updateNativeCounts(data, null, null);
       return;
     }
     const picks = Object.fromEntries(keys.map(k => [k, verified ? best[k] : gym.dots[k] > 0 ? gym : null]));
     const plan = planTrains(stats, happy, energy, picks, perks?.factors ?? ZERO_PERKS, completedThisBatch);
-    if (!plan) { alloc.textContent = 'Training allocation unavailable.'; updateNativeCounts(previewPage, null, null); return; }
+    if (!plan) { alloc.textContent = 'Training allocation unavailable.'; updateNativeCounts(data, null, null); return; }
     if (!plan.used) {
       alloc.textContent = keys.every(k => completedThisBatch.has(k))
         ? 'Suggested trains completed. Waiting for new energy.'
         : 'Not enough energy to train.';
-      updateNativeCounts(previewPage, plan, picks);
+      updateNativeCounts(data, plan, picks);
       return;
     }
     alloc.innerHTML = plan.keys.map((k, i) => {
@@ -842,7 +882,7 @@
       const done = completedThisBatch.has(k) ? ' <small>(done)</small>' : '';
       return `<span>${ABBR[k]} <b>${count} trains</b>${where}${done}</span>`;
     }).join('') + (plan.unused ? `<small>${plan.unused} E unused</small>` : '');
-    updateNativeCounts(previewPage, plan, picks);
+    updateNativeCounts(data, plan, picks);
   }
  
   function refresh() {
@@ -859,7 +899,7 @@
       unlocked: scan.verified ? [...scan.gyms].sort((a,b) => a-b) : null });
     protectTrainControls(data, best, scan.verified);
     if (signature === previousSignature && panel.querySelector('.tga-targets').textContent) {
-      updateNativeCounts(lastNativeData ?? data, lastNativePlan, lastNativePicks);
+      updateNativeCounts(data, lastNativePlan, lastNativePicks);
       return;
     }
     previousSignature = signature;
@@ -876,10 +916,10 @@
     #${PANEL_ID}{box-sizing:border-box;background:#202224;color:#ececec;border:1px solid #3a3d40;
       border-radius:5px;padding:9px 12px;margin:7px 0;font:13px/1.4 Arial,sans-serif}
     #${PANEL_ID} *{box-sizing:border-box}
-    #${PANEL_ID} .tga-head{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;gap:8px}
-    #${PANEL_ID} .tga-head strong{font-size:13px;min-width:0}
-    #${PANEL_ID} .tga-head .tga-meta{text-align:center;white-space:nowrap;margin:0}
-    #${PANEL_ID} .tga-settings{position:relative;justify-self:end}
+    #${PANEL_ID} .tga-head{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:3px 8px}
+    #${PANEL_ID} .tga-head strong{font-size:13px;min-width:0;text-align:left;overflow-wrap:anywhere}
+    #${PANEL_ID} .tga-head .tga-meta{grid-column:1 / -1;grid-row:2;min-width:0;text-align:left;white-space:normal;overflow-wrap:anywhere;margin:0}
+    #${PANEL_ID} .tga-settings{grid-column:2;grid-row:1;position:relative;justify-self:end}
     #${PANEL_ID} .tga-settings summary{cursor:pointer;color:#b5bcc5;font-size:12px;list-style:none;user-select:none}
     #${PANEL_ID} .tga-settings summary::before{content:'⚙ ';font-size:12px}
     #${PANEL_ID} .tga-settings summary::-webkit-details-marker{display:none}
@@ -899,9 +939,8 @@
     #${PANEL_ID} .tga-save{background:#373f49;color:white;border:1px solid #657180;border-radius:4px;padding:4px 13px;cursor:pointer}
     #${PANEL_ID} .tga-error{color:#ff8d8d;font-size:11px}
     #${PANEL_ID} .tga-meta,#${PANEL_ID} .tga-targets,#${PANEL_ID} .tga-perks{color:#b5bcc5;font-size:12px}
-    #${PANEL_ID} .tga-summary{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:3px 16px;margin:5px 0 8px}
-    #${PANEL_ID} .tga-targets{flex:0 1 auto}
-    #${PANEL_ID} .tga-perks{flex:0 1 auto;margin-left:auto;text-align:right}
+    #${PANEL_ID} .tga-summary{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;margin:3px 0 8px}
+    #${PANEL_ID} .tga-targets,#${PANEL_ID} .tga-perks{min-width:0;text-align:left;overflow-wrap:anywhere}
     #${PANEL_ID} .tga-grid{display:grid;grid-template-columns:repeat(var(--tga-columns,3),minmax(0,1fr));gap:10px;margin-bottom:7px}
     #${PANEL_ID} .tga-stat strong{font-size:17px}
     #${PANEL_ID} .tga-track{height:5px;background:#42464a;border-radius:5px;overflow:hidden;margin-top:5px}
@@ -920,8 +959,6 @@
     #gymroot li.tga-blocked button{cursor:not-allowed!important}
     #gymroot li.tga-blocked input.tt-stat-checkbox{cursor:pointer!important}
     @media(max-width:620px){
-      #${PANEL_ID} .tga-head{grid-template-columns:minmax(0,1fr) auto}
-      #${PANEL_ID} .tga-head .tga-meta{grid-column:1 / -1;grid-row:2;text-align:center;white-space:normal}
       #${PANEL_ID}{padding:8px 9px;margin:6px 0;font-size:12px}
       #${PANEL_ID} .tga-form{max-width:min(86vw,320px)}
       #${PANEL_ID} .tga-field input[type=number]{font-size:16px}
@@ -941,7 +978,8 @@
       const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
       return !node?.closest?.(`#${PANEL_ID}`);
     })) scheduleRefresh();
-  }).observe(document.body, { childList: true, characterData: true, subtree: true });
+  }).observe(document.body, { childList: true, characterData: true, subtree: true,
+    attributes: true, attributeFilter: ['aria-valuenow', 'aria-valuemax', 'aria-valuetext', 'aria-label', 'title'] });
   document.addEventListener('visibilitychange', scheduleRefresh);
   window.addEventListener('pageshow', scheduleRefresh);
 })();

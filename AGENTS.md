@@ -10,7 +10,7 @@ The user's current request defines the task. Existing source, metadata, and obse
 
 - Work directly in the verified local checkout in VS Code. Check the active branch and working tree before editing; preserve unrelated user changes.
 - Apply Occam's razor: prefer the smallest complete, correct, robust, and maintainable solution. Additional complexity, including frameworks, bundlers, dependencies, shared abstractions, or restructuring, requires demonstrated justification.
-- Organize scripts by feature under `scripts/<feature>/`, with Web and PDA editions in the same directory.
+- Organize each userscript family under `scripts/<feature>/`, with platform-specific source, `CHANGELOG.md`, and `INFO.md` in `web/` and `pda/` subdirectories. Keep shared tests at the feature root unless a dedicated test directory becomes justified.
 - Preserve existing features, layout, configuration, persisted state, and public interfaces unless the task explicitly changes them. Do not silently fix unrelated issues.
 - Investigate the relevant code and reproduce or explain the defect before changing behavior. Follow existing naming and formatting conventions.
 - Routine tasks need no GitHub issue, feature branch, pull request, or extra governance file. Use the current authorized branch. Do not commit, push, tag, or publish unless requested.
@@ -21,8 +21,10 @@ The user's current request defines the task. Existing source, metadata, and obse
 - Maintain equivalent core functionality across Web/Tampermonkey and Torn PDA while respecting their different APIs, storage, lifecycle, navigation, and UI constraints. Inspect the counterpart edition when changing shared behavior, update both where appropriate, and report intentional differences.
 - Keep every published script installable as a readable, standalone `.user.js` userscript. Do not introduce minification, obfuscation, remote code loaders, or a build pipeline without an approved reason.
 - Preserve `@name`, `@namespace`, `@match`/`@include`, `@grant`, `@connect`, and update-related metadata unless a change is necessary and understood. Do not redirect Greasy Fork updates to development sources.
-- Keep `// @license      MIT` immediately below `@version`. Increment `@version` for a release that changes the published code, independently for each affected edition; do not churn versions for unfinished local experiments.
-- Each script has independent versioning and an adjacent `<script-name>.CHANGELOG.md` (without the `.js` suffix). Preserve existing history; use the current `@version` as the baseline for a missing changelog without inventing historical entries. Record meaningful user-facing changes newest first and update the changelog whenever its release version changes.
+- Keep `// @license      MIT` immediately below `@version`. Use `major.minor.patch` versions for each edition and increment them for releases that change published code, not unfinished local experiments.
+- Equivalent shared feature releases use matching `major.minor` versions, normally with patch `0`. Platform-specific bug fixes increment only the affected edition's patch; the next shared feature release realigns both at the next appropriate shared version. Alignment must reflect functional parity: inspect actual functionality and published versions before initial alignment, never downgrade a published version, and never bump solely for cosmetic alignment.
+- Every platform edition must contain its own `CHANGELOG.md` and `INFO.md`. Preserve changelog history; baseline a missing changelog at the current `@version` without inventing earlier entries. Record meaningful user-facing changes newest first and update each affected changelog whenever its release version changes.
+- Treat each edition's `INFO.md` as the source of truth for its Greasy Fork Additional Info. Keep shared Web/PDA descriptions aligned, allowing genuine platform differences. Development editions use an accurate, minimal placeholder until a verified feature description is approved. Update descriptions when a release changes functionality, installation, compatibility, or other documented behavior; keep them concise and do not advertise unimplemented or unverified features.
 - Preserve existing API key, permissions, and storage integration. Do not embed real keys, tokens, player secrets, or captured private API payloads in source, tests, logs, or commits. Never send them to an unapproved service.
 - Verify Torn API endpoints, response fields, time units, cooldown logic, and missing/error states against current contracts or evidence. Do not silently turn unknown data into a valid value.
 - For UI changes, handle Torn's dynamic navigation and rerenders without duplicate elements, event handlers, observers, or uncontrolled polling. Keep overlays small, readable, and consistent with the affected script's existing design.
@@ -35,7 +37,7 @@ The user's current request defines the task. Existing source, metadata, and obse
 - Inspect the complete affected diff and run `git diff --check` for tracked changes. Also inspect new untracked files, which `git diff` does not show.
 - When practical, add a small focused regression test for meaningful logic changes. Clearly identify behavior that still needs real Tampermonkey or Torn PDA testing. Syntax checks alone do not establish runtime compatibility.
 - Report concisely: files changed, behavior changed, validation run and outcomes, remaining risks, and any manual verification required. Do not paste entire scripts or large diffs by default.
-- Never publish to Greasy Fork or alter release/update infrastructure without explicit authorization. Publishing remains a separate user-controlled step.
+- Greasy Fork synchronization is publication infrastructure requiring explicit user authorization. Once enabled, treat pushes to its tracked release branch as publication actions. Publish only validated, intentional releases with updated version metadata and changelogs. Do not push, publish, or alter release/update infrastructure without explicit user authorization.
 
 ## Local PowerShell evidence
 

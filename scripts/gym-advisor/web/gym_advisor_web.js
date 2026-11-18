@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Likidy's Gym Advisor
 // @namespace    local.torn.gym.ratio
-// @version      0.4.9
+// @version      0.6.0
 // @license      MIT
 // @description  Ratio advisor with perk-adjusted gain previews and safe native train-count autofill.
 // @match        https://www.torn.com/gym.php*
@@ -393,18 +393,42 @@
     return null;
   }
  
+  function readHappiness() {
+    // Resource bars can live outside #gymroot, including in the mobile sidebar.
+    const bars = document.querySelectorAll(
+      '#barHappy, #sidebarroot [class*="happy"], #sidebar [class*="happy"], ' +
+      '[class*="bar"][class*="happy"], [class*="bar"][class*="happiness"], ' +
+      '[data-resource="happy"], [data-resource="happiness"], ' +
+      '[title^="Happy:" i], [title^="Happiness:" i], ' +
+      '[aria-label^="Happy" i], [aria-label^="Happiness" i]');
+    for (const bar of bars) {
+      if (bar.closest(`#${PANEL_ID}`)) continue;
+      for (const text of [bar.textContent, bar.getAttribute('aria-label'),
+        bar.getAttribute('title'), bar.getAttribute('aria-valuetext')]) {
+        const pair = text?.match(/([\d,]+)\s*\/\s*[\d,]+/);
+        if (pair) return parseNumber(pair[1]); // Always the current value, never the maximum.
+      }
+      const current = bar.matches('[aria-valuenow]') ? bar : bar.querySelector('[aria-valuenow]');
+      const value = parseNumber(current?.getAttribute('aria-valuenow'));
+      // Some progress bars expose percentages instead of resource quantities.
+      if (Number.isFinite(value) && parseNumber(current.getAttribute('aria-valuemax')) > 100) return value;
+    }
+    const labelled = document.body.innerText?.match(/\bHapp(?:y|iness)\s*:?\s*([\d,]+)\s*\/\s*[\d,]+/i);
+    return parseNumber(labelled?.[1]);
+  }
+
   function readCurrentPage() {
+    const happy = readHappiness();
     const stats = Object.fromEntries(ALL_STATS.map(key => [key, readStat(key)]));
     // Exclude our own UI from the body text so messages cannot be mistaken for game data.
     const text = document.body.innerText || '';
     const energyText = text.match(/\byou have\s+([\d,]+)\s*\/\s*([\d,]+)\s+energy available\b/i);
     const fallbackEnergy = text.match(/\bEnergy\s*:\s*([\d,]+)\s*\/\s*([\d,]+)/i);
-    const happyText = text.match(/\bHapp(?:y|iness)\s*:?\s*([\d,]+)\s*\/\s*([\d,]+)/i);
     const gymText = text.match(/\bWelcome to\s+([^!\n]{2,60})!/i);
     const gymName = gymText?.[1]?.trim().toLowerCase() || '';
     const gym = GYM_BY_NAME.get(gymName) || null;
     return { stats, energy: parseNumber((energyText || fallbackEnergy)?.[1]),
-      happy: parseNumber(happyText?.[1]), gym, gymName };
+      happy: happy ?? 5025, happyEstimated: happy === null, gym, gymName };
   }
  
   function createPanel() {
@@ -505,6 +529,7 @@
       pendingTraining.clear();
       autoAttempts.clear();
       manualEdits.clear();
+      batchEnergyLow = lastObservedEnergy;
       try { localStorage.setItem(TARGET_KEY, JSON.stringify(target)); } catch (_) {}
       error.textContent = '';
       panel.querySelector('.tga-settings').open = false;
@@ -523,12 +548,13 @@
   }
  
   // Native Torn gym counts are separate from Advisor settings inputs.
-  const nativeCounts = new WeakMap();
+  let nativeCounts = new WeakMap();
   const autoAttempts = new Map();
   const manualEdits = new Map();
   const completedThisBatch = new Set();
   const pendingTraining = new Map();
   let lastObservedEnergy = null;
+  let batchEnergyLow = null;
   let updatingNative = false;
   let lastNativeData = null;
   let lastNativePlan = null;
@@ -577,9 +603,13 @@
   }
  
   function trackTrainingCompletion(page) {
-    // A meaningful energy gain begins a new batch. Ignore single-E regeneration.
-    if (Number.isFinite(lastObservedEnergy) && Number.isFinite(page.energy) &&
-        page.energy - lastObservedEnergy >= Math.max(20, 2 * (page.gym?.energy ?? 10))) {
+    // Measure net regeneration since the lowest reading, not just the latest tick.
+    if (Number.isFinite(page.energy)) {
+      if (!Number.isFinite(batchEnergyLow) || page.energy < lastObservedEnergy) batchEnergyLow = page.energy;
+    }
+    if (Number.isFinite(page.energy) &&
+        page.energy - batchEnergyLow >= Math.max(20, 2 * (page.gym?.energy ?? 10))) {
+      batchEnergyLow = page.energy;
       completedThisBatch.clear();
       pendingTraining.clear();
       autoAttempts.clear();
@@ -616,7 +646,18 @@
       `Est. +${formatGain(gain)} ${ABBR[key]}${shortfall}`);
   }
  
+  function hasTrainingData(page) {
+    return Number.isFinite(page.energy) && selected().every(key => Number.isFinite(page.stats[key]));
+  }
+
   function updateNativeCounts(page, plan, picks) {
+    if (!hasTrainingData(page)) {
+      lastNativeData = lastNativePlan = lastNativePicks = null;
+      autoAttempts.clear();
+      nativeCounts = new WeakMap();
+      for (const key of ALL_STATS) statTile(key)?.removeAttribute('data-tga-gain');
+      return;
+    }
     lastNativeData = page;
     lastNativePlan = plan;
     lastNativePicks = picks;
@@ -646,6 +687,8 @@
         completed: completedThisBatch.has(key),
         factors: perks?.factors ?? ZERO_PERKS
       });
+      // An edit made during an incomplete reading belongs to the first recovered scene.
+      if (manualEdits.has(key) && manualEdits.get(key) === null) manualEdits.set(key, scene);
       if (!allowAnyTraining && manualEdits.get(key) && manualEdits.get(key) !== scene) {
         manualEdits.delete(key);
       }
@@ -685,8 +728,8 @@
     if (!key) return;
     const history = nativeCounts.get(event.target);
     if (history) history.manual = true;
+    manualEdits.set(key, lastNativeData ? pageContext(lastNativeData) : null);
     if (lastNativeData) {
-      manualEdits.set(key, pageContext(lastNativeData));
       updateGainLabel(key, lastNativeData);
     }
   }, true);
@@ -764,18 +807,21 @@
     const { stats, energy, happy, gym } = data;
     const keys = selected();
     panel.querySelector('.tga-meta').innerHTML = `${gym ? `${gym.name} · ${gym.energy} E/train` : 'Gym not recognized'} · <b>${Number.isFinite(energy) ? energy : '?'} E available</b>`;
+    if (data.happyEstimated) {
+      panel.querySelector('.tga-meta').insertAdjacentText('beforeend', ' · Happy unavailable · estimating at 5,025');
+    }
     panel.querySelector('.tga-targets').textContent = keys.map(k => `${target[k]}% ${ABBR[k]}`).join(' · ');
     panel.querySelector('.tga-perks').textContent =
       (perks ? 'Perks: ' + keys.map(k => `${ABBR[k]} ×${perks.factors[k].toFixed(3)}`).join(' ') :
         'Perks not loaded') + (perkError ? ' · ' + perkError : '');
-    const present = keys.every(k => Number.isFinite(stats[k])) && Number.isFinite(energy);
+    const present = hasTrainingData(data);
     const grid = panel.querySelector('.tga-grid');
     grid.style.setProperty('--tga-columns', String(keys.length));
     const alloc = panel.querySelector('.tga-alloc');
     if (!present) {
       grid.textContent = '';
       alloc.textContent = 'Waiting for visible battle stats and energy.';
-      for (const key of ALL_STATS) statTile(key)?.removeAttribute('data-tga-gain');
+      updateNativeCounts(data, null, null);
       return;
     }
     const shares = proportions(stats, keys);
@@ -901,6 +947,7 @@
       const node = record.target.nodeType === 1 ? record.target : record.target.parentElement;
       return !node?.closest?.(`#${PANEL_ID}`);
     })) scheduleRefresh();
-  }).observe(document.body, { childList: true, characterData: true, subtree: true });
+  }).observe(document.body, { childList: true, characterData: true, subtree: true,
+    attributes: true, attributeFilter: ['aria-valuenow', 'aria-valuemax', 'aria-valuetext', 'aria-label', 'title'] });
   document.addEventListener('visibilitychange', scheduleRefresh);
 })();
